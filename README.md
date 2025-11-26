@@ -1,6 +1,7 @@
 # sstring
 
 Highly Optimized SSO Friendly String Implementation. Just replace your `std::string` to `libsstring::sstring`
+This `sstring` is used for DVP/Galculator and other interpreter systems developed by DOF Studio.
 
 
 # Usage
