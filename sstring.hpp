@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <iterator>
 #include <type_traits>
+#include <array>
 #include <memory>
 #include <memory_resource>
 #include <cassert>
@@ -99,7 +100,7 @@ namespace libsstring {
         typename Allocator = std::allocator<CharT>,
         typename SSO_FlagType = std::uint8_t,
         size_t   SSO_ReservedBytes = 30,
-        size_t   SSO_StructAlignByte = 8
+        size_t   SSO_StructAlignByte = 16
     >
     class basic_sstring : private allocator_holder<Allocator> {
         static_assert(sizeof(CharT) == 1, "basic_sstring currently supports only byte-sized CharT, aka. char");
@@ -117,6 +118,7 @@ namespace libsstring {
         using flag_type = SSO_FlagType;
         using byte_type = unsigned char;
         using size_type = std::size_t;
+        using bool_type = bool;
         using difference_type = std::ptrdiff_t;
         using reference = value_type&;
         using const_reference = const value_type&;
@@ -130,22 +132,48 @@ namespace libsstring {
         static constexpr size_type npos = static_cast<size_type>(-1);
 
     private:
-        // Storage union aims to keep object compact. We separate allocator (via base or member).
-        union Storage {
+        // padding state and size
+        constexpr static inline size_type HeapBasicSize = sizeof(CharT*) + 3 * sizeof(size_type);
+        constexpr static inline bool_type HeapPaddingState = SSO_ReservedBytes + 2 * sizeof(flag_type) > HeapBasicSize;
+        constexpr static inline size_type HeapPaddingSize = HeapPaddingState ? SSO_ReservedBytes + 2 * sizeof(flag_type) - HeapBasicSize : SSO_StructAlignByte;
+
+        // small string optimization
+        struct alignas(SSO_StructAlignByte) SSO {
+            byte_type buf[SSO_ReservedBytes];
+            flag_type len;                           // length (0 -> N - 1)
+            flag_type tag;                           // tag byte (used to overlap heap.flag MSB)
+        };
+
+        // heap allocated strings, Base
+        template <bool_type _HasPadding>
+        struct alignas(SSO_StructAlignByte) Heap;
+
+        // heap allocated strings, compatible for std::string, with padding
+        template <>
+        struct alignas(SSO_StructAlignByte) Heap<true> {
+            CharT* ptr;                              // data ptr
+            size_type size;                          // size, used
+            size_type cap;                           // capacity, 
+            byte_type pad[HeapPaddingSize];          // optional padding
+            size_type flag;                          // highest bit used as is - heap flag
+        };
+
+        // heap allocated strings, compatible for std::string, without padding
+        template <>
+        struct alignas(SSO_StructAlignByte) Heap<false> {
+            CharT* ptr;                              // data ptr
+            size_type size;                          // size, used
+            size_type cap;                           // capacity, 
+            size_type flag;                          // highest bit used as is - heap flag
+        };
+
+        // storage union without padding
+        union alignas(SSO_StructAlignByte) Storage {
             // small string optimization
-            struct alignas(SSO_StructAlignByte) SSO {
-                byte_type buf[SSO_ReservedBytes];
-                flag_type len;         // length (0 -> N - 1)
-                flag_type tag;         // tag byte (used to overlap heap.cap MSB)
-            } sso;
+            SSO sso;
 
             // heap allocated strings, compatible for std::string
-            struct alignas(SSO_StructAlignByte) Heap {
-                CharT* ptr;            // data ptr
-                size_type size;        // size, used
-                size_type cap;         // capacity, 
-                size_type flag;        // highest bit used as is - heap flag
-            } heap;
+            Heap<HeapPaddingState> heap;
 
             // default constructor
             constexpr Storage() noexcept { std::memset(this, 0, sizeof(Storage)); }
@@ -224,6 +252,11 @@ namespace libsstring {
             return sso_capacity_bytes() - 1; 
         }      
 
+        // @brief get current size when using sso
+        constexpr flag_type sso_size() const noexcept {
+            return storage.sso.len;
+        }
+
         // @brief comparasion simd memchr
         static constexpr const void* simd_memchr(const void* buf, int c, size_t n) noexcept {
             return std::memchr(buf, c, n);
@@ -270,6 +303,22 @@ namespace libsstring {
             Traits::move(dest, src, count);
         }
 
+        // @brief reallocate heap capacity and copy memory
+        constexpr void reallocate_heap_copy(size_type new_capacity) {
+            size_type cur_cap = heap_capacity_raw();
+            size_type newcap = std::max(new_capacity, cur_cap * 2);
+            CharT* p = allocate_buffer(newcap);
+            // copy existing
+            std::memcpy(p, storage.heap.ptr, storage.heap.size);
+            p[storage.heap.size] = '\0';
+            // dealloc old
+            deallocate_buffer(storage.heap.ptr, cur_cap);
+            storage.heap.ptr = p;
+            storage.heap.cap = newcap;
+            set_heap_flag();
+            return;
+        }
+
         // @brief ensure heap mode and reserve at least new_capacity bytes (includes space for null termin.)
         constexpr void make_non_sso_and_reserve(size_type new_capacity) {
             // if sso, then need to copy data
@@ -290,16 +339,7 @@ namespace libsstring {
                 if (cur_cap >= new_capacity) [[unlikely]] {
                     return;
                 }
-                size_type newcap = std::max(new_capacity, cur_cap * 2);
-                CharT* p = allocate_buffer(newcap);
-                // copy existing
-                std::memcpy(p, storage.heap.ptr, storage.heap.size);
-                p[storage.heap.size] = '\0';
-                // dealloc old
-                deallocate_buffer(storage.heap.ptr, cur_cap);
-                storage.heap.ptr = p;
-                storage.heap.cap = newcap;
-                set_heap_flag();
+                reallocate_heap_copy(new_capacity);
             }
         }
 
@@ -310,17 +350,13 @@ namespace libsstring {
         // @brief construct a basic_sstring from an empty allocator
         constexpr basic_sstring() noexcept(std::is_nothrow_default_constructible_v<allocator_type>) {
             // empty SSO
-            storage.sso.len = 0;
-            storage.sso.tag = 0;
-            storage.sso.buf[0] = '\0';
+            reset_storage(storage);
         }
 
         // @brief construct a basic_sstring from an allocator
         constexpr explicit basic_sstring(const allocator_type& alloc) noexcept : allocator_holder<Allocator>(alloc) {
             // empty SSO
-            storage.sso.len = 0;
-            storage.sso.tag = 0;
-            storage.sso.buf[0] = '\0';
+            reset_storage(storage);
         }
 
         // @brief construct a basic_sstring using copy construction
@@ -329,7 +365,7 @@ namespace libsstring {
         {
             // SSO, just copy the storage
             if (other.is_sso()) [[likely]] {
-                std::memcpy(&storage, &other.storage, sizeof(Storage));
+                copy_storage(storage, other.storage);
             }
             // Heap, do allocation
             else {
@@ -414,9 +450,9 @@ namespace libsstring {
             // SSO, just copy the storage
             size_type len = Traits::length(s);
             if (len <= sso_max_size()) [[likely]] {
-                std::memcpy(storage.sso.buf, s, len);
                 storage.sso.len = static_cast<flag_type>(len);
                 storage.sso.tag = 0;
+                std::memcpy(storage.sso.buf, s, len);
                 storage.sso.buf[len] = '\0';
             }
             // Copy semantics
@@ -443,10 +479,10 @@ namespace libsstring {
             // SSO, just copy the storage
             size_type len = Traits::length(s);
             if (len <= sso_max_size()) [[likely]] {
-                std::memcpy(storage.sso.buf, s, len);
                 storage.sso.len = static_cast<flag_type>(len);
-                storage.sso.buf[len] = '\0';
                 storage.sso.tag = 0;
+                std::memcpy(storage.sso.buf, s, len);
+                storage.sso.buf[len] = '\0';
             }
             // dynamically
             else {
@@ -466,10 +502,11 @@ namespace libsstring {
             // SSO, just copy the storage
             size_type len = sv.size();
             if (len <= sso_max_size()) [[likely]] {
-                std::memcpy(storage.sso.buf, sv.data(), len);
-                storage.sso.len = static_cast<flag_type>(len);
+                // Magic happens: first do the length and then copy the data, performance boosts
                 storage.sso.tag = 0;
                 storage.sso.buf[len] = '\0';
+                std::memcpy(storage.sso.buf, sv.data(), len);
+                storage.sso.len = static_cast<flag_type>(len);
             }
             // dynamically
             else {
@@ -489,10 +526,11 @@ namespace libsstring {
             // SSO, just copy the storage
             size_type len = sv.size();
             if (len <= sso_max_size()) [[likely]] {
-                std::memcpy(storage.sso.buf, sv.data(), len);
+                // Magic happens: first do the length and then copy the data, performance boosts
                 storage.sso.len = static_cast<flag_type>(len);
-                storage.sso.buf[len] = '\0';
                 storage.sso.tag = 0;
+                std::memcpy(storage.sso.buf, sv.data(), len);
+                storage.sso.buf[len] = '\0';
             }
             // dynamically
             else {
@@ -513,10 +551,11 @@ namespace libsstring {
         {
             // SSO, just copy the storage
             if (count <= sso_max_size()) [[likely]] {
-                std::memset(storage.sso.buf, static_cast<unsigned char>(ch), count);
+                // Magic happens: first do the length and then copy the data, performance boosts
                 storage.sso.len = static_cast<flag_type>(count);
-                storage.sso.buf[count] = '\0';
                 storage.sso.tag = 0;
+                std::memset(storage.sso.buf, static_cast<unsigned char>(ch), count);
+                storage.sso.buf[count] = '\0';
             }
             // dynamically
             else {
@@ -542,8 +581,7 @@ namespace libsstring {
         #endif
             // If not heap, dealloate res
             if (is_heap()) [[unlikely]] {
-                size_type cap = heap_capacity_raw();
-                deallocate_buffer(storage.heap.ptr, cap);
+                deallocate_buffer(storage.heap.ptr, heap_capacity_raw());
             }
         }
 
@@ -845,19 +883,31 @@ namespace libsstring {
         // @brief push back a character
         constexpr void push_back(CharT ch) {
             size_type cur = size();
-            if (is_sso() && cur < sso_max_size()) [[likely]] {
-                storage.sso.buf[cur] = static_cast<unsigned char>(ch);
-                storage.sso.buf[cur + 1] = '\0';
-                storage.sso.len = static_cast<flag_type>(cur + 1);
-                return;
+            size_type need = cur + 2;
+            // currently SSO Mode
+            if (is_sso()) [[likely]] {
+                // SSO already good
+                if (cur < sso_max_size()) [[likely]] {
+                    storage.sso.len = static_cast<flag_type>(cur + 1);
+                    storage.sso.buf[cur] = static_cast<unsigned char>(ch);
+                    storage.sso.buf[cur + 1] = '\0';
+                }
+                
+                // SSO need heap allocation
+                else {
+                    make_non_sso_and_reserve(need);
+                    storage.heap.size = cur + 1;
+                    storage.heap.ptr[cur] = ch;
+                    storage.heap.ptr[cur + 1] = '\0';
+                }
             }
             else {
-                size_type need = cur + 2;
-                make_non_sso_and_reserve(need);
+                if (need > heap_capacity_raw()) [[unlikely]] {
+                    reallocate_heap_copy(need);
+                }
+                storage.heap.size = cur + 1;
                 storage.heap.ptr[cur] = ch;
                 storage.heap.ptr[cur + 1] = '\0';
-                storage.heap.size = cur + 1;
-                return;
             }
         }
 
@@ -867,13 +917,14 @@ namespace libsstring {
             if (cur == 0) [[unlikely]] {
                 return;
             }
+            size_type tar = cur - 1;
             if (is_sso()) [[likely]] {
-                storage.sso.len = static_cast<flag_type>(cur - 1);
-                storage.sso.buf[cur - 1] = '\0';
+                storage.sso.buf[tar] = '\0';
+                storage.sso.len = static_cast<flag_type>(tar);
             }
             else {
-                storage.heap.size = cur - 1;
-                storage.heap.ptr[cur - 1] = '\0';
+                storage.heap.ptr[tar] = '\0';
+                storage.heap.size = tar;
             }
         }
 
@@ -885,14 +936,18 @@ namespace libsstring {
             }
             // shrink
             if (new_size < cur) [[unlikely]] {
-                if (!is_heap()) storage.sso.len = static_cast<flag_type>(new_size);
-                else storage.heap.size = new_size;
-                if (!is_heap()) storage.sso.buf[new_size] = '\0';
-                else storage.heap.ptr[new_size] = '\0';
+                if (is_sso()) [[likely]] {
+                    storage.sso.len = static_cast<flag_type>(new_size);
+                    storage.sso.buf[new_size] = '\0';
+                }
+                else {
+                    storage.heap.size = new_size;
+                    storage.heap.ptr[new_size] = '\0';
+                }
                 return;
             }
             // enlarge
-            else{
+            else {
                 size_type need = new_size + 1;
                 make_non_sso_and_reserve(need);
                 std::fill(storage.heap.ptr + cur, storage.heap.ptr + new_size, ch);
@@ -901,46 +956,25 @@ namespace libsstring {
             }
         }
 
-        // @brief append a C-string to the back of current string
-        constexpr basic_sstring& append(const CharT* s) {
-            size_type add = Traits::length(s);
-            size_type cur = size();
-            size_type need = cur + add + 1;
-            // sso mode and do not need to reserve
-            if (is_sso() && need <= sso_capacity_bytes()) [[likely]] {
-                std::memcpy(storage.sso.buf + cur, s, add);
-                storage.sso.len = static_cast<flag_type>(cur + add);
-                storage.sso.buf[cur + add] = '\0';
-                return *this;
-            }
-            // non-sso mode
-            else {
-                make_non_sso_and_reserve(need);
-                std::memcpy(storage.heap.ptr + cur, s, add);
-                storage.heap.size = cur + add;
-                storage.heap.ptr[storage.heap.size] = '\0';
-                return *this;
-            }
-        }
-
         // @brief append a string to the back of current string
         constexpr basic_sstring& append(std::basic_string_view<CharT, Traits> sv) {
-            size_type add = sv.size();
-            size_type cur = size();
-            size_type need = cur + add + 1;
+            const size_type add = sv.size();
+            const size_type cur = size();
+            const size_type tar = cur + add;
+            const size_type need = tar + 1;
             // sso mode and do not need to reserve
             if (is_sso() && need <= sso_capacity_bytes()) [[likely]] {
                 std::memcpy(storage.sso.buf + cur, sv.data(), add);
-                storage.sso.len = static_cast<flag_type>(cur + add);
-                storage.sso.buf[cur + add] = '\0';
+                storage.sso.buf[tar] = '\0';
+                storage.sso.len = static_cast<flag_type>(tar);
                 return *this;
             }
             // non-sso mode
             else {
                 make_non_sso_and_reserve(need);
                 std::memcpy(storage.heap.ptr + cur, sv.data(), add);
-                storage.heap.size = cur + add;
                 storage.heap.ptr[storage.heap.size] = '\0';
+                storage.heap.size = tar;
                 return *this;
             }
         }
@@ -948,6 +982,17 @@ namespace libsstring {
         // @brief append a basic_sstring to the back of current string
         constexpr basic_sstring& append(const basic_sstring& other) {
             return append(std::string_view(other.data(), other.size())); 
+        }
+
+        // @brief append a C-string to the back of current string
+        constexpr basic_sstring& append(const CharT* s) {
+            size_type length = Traits::length(s);
+            return append(std::basic_string_view<CharT, Traits>(s, length));
+        }
+
+        // @brief append a C-string with length to the back of current string
+        constexpr basic_sstring& append(const CharT* s, size_type length) {
+            return append(std::basic_string_view<CharT, Traits>(s, length));
         }
         
         // @brief operator+= to append a string to the back of current string
@@ -958,10 +1003,11 @@ namespace libsstring {
             return append(o);
         }
         constexpr basic_sstring& operator+=(const CharT* s) {
-            return append(std::string_view(s));
+            return append(s);
         }
         constexpr basic_sstring& operator+=(CharT ch) {
-            push_back(ch); return *this; 
+            push_back(ch); 
+            return *this; 
         }
 
         // @brief insert a string after a specific position
@@ -1068,18 +1114,70 @@ namespace libsstring {
             return basic_sstring(std::string_view(data() + pos, count), get_alloc());
         }
 
-        // brief find a string from a position
+        // @brief find a single character
+        constexpr size_type find(CharT ch, size_type pos = 0) const noexcept {
+            const size_type n = size();
+            if (pos >= n) {
+                return npos;
+            }
+
+            const unsigned char* hay = reinterpret_cast<const unsigned char*>(data() + pos);
+            const unsigned char* end = reinterpret_cast<const unsigned char*>(data() + n);
+
+            const void* p = std::memchr(hay, ch, end - hay);
+            if (!p) {
+                return npos;
+            }
+            return static_cast<size_type>(reinterpret_cast<const CharT*>(p) - data());
+        }
+
+        // @brief find double characters
+        constexpr size_type find(CharT ch1, CharT ch2, size_type pos = 0) const noexcept {
+            const size_type n = size();
+            if (pos + 1 >= n) {
+                return npos;
+            }
+
+            const unsigned char* hay = reinterpret_cast<const unsigned char*>(data() + pos);
+            const unsigned char* end = reinterpret_cast<const unsigned char*>(data() + n - 1); // Ensures 2 chars
+
+            while (hay < end) {
+                // find the 1st by memchr
+                const void* p = std::memchr(hay, ch1, end - hay);
+                if (!p) {
+                    return npos;
+                }
+
+                size_type idx = static_cast<size_type>(reinterpret_cast<const CharT*>(p) - data());
+
+                // Check next 
+                if (data()[idx + 1] == ch2) {
+                    return idx;
+                }
+
+                // Go on and on
+                hay = reinterpret_cast<const unsigned char*>(p) + 1;
+            }
+
+            return npos;
+        }
+
+        // @brief find a string from a position
         constexpr size_type find(std::basic_string_view<CharT, Traits> sv, size_type pos = 0) const noexcept {
+
             const size_type n = size();
             const size_type m = sv.size();
             if (pos > n) [[unlikely]] {
                 return npos;
             }
             if (m == 0) [[unlikely]] {
-                    return pos;
-                }
-            if (m > n - pos) [[unlikely]] {
                 return npos;
+            }
+            else if (m > n - pos) [[unlikely]] {
+                return npos;
+            }
+            else if (m > 64) {
+                return find_bmh(sv, pos);
             }
 
             const CharT* hay = data() + pos;
@@ -1094,7 +1192,7 @@ namespace libsstring {
             const unsigned char* end = cur + search_len;
 
             while (true) {
-                const void* p = memchr(cur, first, end - cur);
+                const void* p = std::memchr(cur, first, end - cur);
                 if (!p) {
                     return npos;
                 }
@@ -1111,6 +1209,51 @@ namespace libsstring {
             }
         }
 
+        // @brief bmh find a string from a position
+        constexpr size_type find_bmh(std::basic_string_view<CharT, Traits> sv, size_type pos = 0) const {
+            const size_type n = size();
+            const size_type m = sv.size();
+            if (pos > n) [[unlikely]] {
+                return npos;
+            }
+            if (m == 0) [[unlikely]] {
+                return npos;
+            }
+            else if (m > n - pos) [[unlikely]] {
+                return npos;
+            }
+
+            const CharT* hay = data() + pos;
+            // build shift table (256 entries)
+            std::array<size_type, 256> shift;
+            shift.fill(m);
+            for (size_type i = 0; i < m - 1; ++i) {
+                unsigned char uc = static_cast<unsigned char>(sv.data()[i]);     // local unsigned char
+                shift[static_cast<size_type>(uc)] = m - i - 1;                   // index as size_type
+            }
+
+            const size_type max_idx = n - pos - m;
+            size_type idx = 0;
+            while (idx <= max_idx) {
+                const CharT* candidate = hay + idx;
+
+                // Compare from end
+                size_type j = m - 1;
+                while (j != size_type(-1) && candidate[j] == sv.data()[j]) {
+                    --j;
+                }
+                if (j == size_type(-1)) {
+                    return static_cast<size_type>(candidate - data());
+                }
+
+                // Use last character of current window to index shift table (safe cast)
+                unsigned char uc_last = static_cast<unsigned char>(candidate[m - 1]);
+                idx += shift[static_cast<size_type>(uc_last)];
+            }
+
+            return npos;
+        }
+
         // @brief legacy find a string from a position
         constexpr size_type find_legacy(std::basic_string_view<CharT, Traits> sv, size_type pos = 0) const noexcept {
             // too big position
@@ -1124,23 +1267,6 @@ namespace libsstring {
                 return npos;
             }
             return static_cast<size_type>(p - data());
-        }
-
-        // @brief find a single character
-        constexpr size_type find(CharT ch, size_type pos = 0) const noexcept {
-            const size_type n = size();
-            if (pos >= n) {
-                return npos;
-            }
-
-            const unsigned char* hay = reinterpret_cast<const unsigned char*>(data() + pos);
-            const unsigned char* end = reinterpret_cast<const unsigned char*>(data() + n);
-
-            const void* p = std::memchr(hay, ch, end - hay);
-            if (!p) {
-                return npos;
-            }
-            return static_cast<size_type>(reinterpret_cast<const CharT*>(p) - data());
         }
 
         // @brief compare with another string
@@ -1197,34 +1323,53 @@ namespace libsstring {
             }
         }
 
-        // @brief inplace trim a basic_sstring from left
-        constexpr void ltrim(const CharT* chars = " \t\r\n") noexcept {
-            std::basic_string_view<CharT, Traits> sv(chars);
+        // @brief trim a basic_sstring from left as a string_view
+        constexpr std::basic_string_view<CharT, Traits> ltrim_view(std::basic_string_view<CharT, Traits> chars = " \t\r\n") const noexcept {
             size_type i = 0;
-            while (i < size() && sv.find(data()[i]) != std::basic_string_view<CharT>::npos) {
+            while (i < size() && chars.find(data()[i]) != std::basic_string_view<CharT, Traits>::npos) {
                 ++i;
             }
-            if (i > 0) {
-                erase(0, i);
+            return std::basic_string_view<CharT, Traits>(data() + i, size() - i);
+        }
+
+        // @brief trim a basic_sstring from right as a string_view
+        constexpr std::basic_string_view<CharT, Traits> rtrim_view(std::basic_string_view<CharT, Traits> chars = " \t\r\n") const noexcept {
+            size_type i = size();
+            while (i > 0 && chars.find(data()[i - 1]) != std::basic_string_view<CharT, Traits>::npos) {
+                --i;
             }
+            return std::basic_string_view<CharT, Traits>(data(), i);
+        }
+
+        // @brief trim a basic_sstring from both sideas a string_view
+        constexpr std::basic_string_view<CharT, Traits> trim_view(std::basic_string_view<CharT, Traits> chars = " \t\r\n") const noexcept {
+            auto left = ltrim_view(chars);
+            std::basic_string_view<CharT, Traits> right(chars);
+
+            size_type end = left.size();
+            const CharT* ptr = left.data();
+            while (end > 0 && right.find(ptr[end - 1]) != std::basic_string_view<CharT, Traits>::npos) {
+                --end;
+            }
+            return std::basic_string_view<CharT, Traits>(ptr, end);
+        }
+
+        // @brief inplace trim a basic_sstring from left
+        constexpr void ltrim(std::basic_string_view<CharT, Traits> chars = " \t\r\n") noexcept {
+            auto v = ltrim_view(chars);
+            this->assign(v.begin(), v.end());
         }
 
         // @brief inplace trim a basic_sstring from right
-        constexpr void rtrim(const CharT* chars = " \t\r\n") noexcept {
-            std::basic_string_view<CharT, Traits> sv(chars);
-            size_type i = size();
-            while (i > 0 && sv.find(data()[i - 1]) != std::basic_string_view<CharT>::npos) {
-                --i;
-            }
-            if (i < size()) {
-                erase(i, size() - i);
-            }
+        constexpr void rtrim(std::basic_string_view<CharT, Traits> chars = " \t\r\n") noexcept {
+            auto v = rtrim_view(chars);
+            this->assign(v.begin(), v.end());
         }
 
         // @brief inplace trim a basic_sstring from both side
-        constexpr void trim(const CharT* chars = " \t\r\n") noexcept {
-            ltrim(chars);
-            rtrim(chars);
+        constexpr void trim(std::basic_string_view<CharT, Traits> chars = " \t\r\n") noexcept {
+            auto v = trim_view(chars);
+            this->assign(v.begin(), v.end());
         }
 
     public:
@@ -1254,6 +1399,15 @@ namespace libsstring {
         }
 
     public:
+        // @brief generic compare (in content)
+        friend auto operator<=>(const basic_sstring& a, const basic_sstring& b) noexcept {
+            const auto cmp = Traits::compare(a.data(), b.data(), std::min(a.size(), b.size()));
+            if (cmp != 0) {
+                return cmp <=> 0;
+            }
+            return a.size() <=> b.size();
+        }
+
         // @brief compare equality (in content)
         friend bool operator==(const basic_sstring& a, const basic_sstring& b) noexcept {
             return a.size() == b.size() && Traits::compare(a.data(), b.data(), a.size()) == 0;
@@ -1264,10 +1418,10 @@ namespace libsstring {
     };
 
     // convenience alias for char basic sstring
-    using sstring = basic_sstring<char, std::char_traits<char>, std::allocator<char>, std::uint8_t, 30, 8>;
+    using sstring = basic_sstring<char, std::char_traits<char>, std::allocator<char>, std::uint8_t, 30, 16>;
     
     // convenience alias for char basic string with pmr
-    using sstring_pmr = basic_sstring<char, std::char_traits<char>, std::pmr::polymorphic_allocator<char>, std::uint8_t, 30, 8>;
+    using sstring_pmr = basic_sstring<char, std::char_traits<char>, std::pmr::polymorphic_allocator<char>, std::uint8_t, 30, 16>;
 
 }
 // namespace libsstring ends
